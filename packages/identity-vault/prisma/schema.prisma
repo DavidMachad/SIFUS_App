@@ -1,0 +1,98 @@
+// =============================================================================
+// SIFUS · Bóveda de Identidad (PII)
+//
+// Es la única base de datos que contiene Información Personal Identificable.
+// Separación estricta frente a los datos biométricos y psicométricos:
+//  - Base de datos, credenciales y llaves de cifrado DISTINTAS a las de salud.
+//  - El único enlace es subjectId (UUID v4 aleatorio), que en la base de salud
+//    es User.id. No existe una llave foránea física entre ambas bases.
+//  - Ningún servicio de analítica tiene acceso a esta base.
+//  - Cada re-identificación (unir PII con datos de salud, p. ej. para emitir un
+//    informe clínico con nombre) queda en IdentityAccessLog con su propósito.
+//  - Los campos PII se cifran a nivel de aplicación (AES-256-GCM); la búsqueda
+//    por correo/documento se hace con un HMAC-SHA256 ("blind index"), nunca en
+//    texto plano.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../../node_modules/@sifus/identity-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("IDENTITY_DATABASE_URL")
+}
+
+enum DocumentType {
+  CC // cédula de ciudadanía
+  TI // tarjeta de identidad
+  CE // cédula de extranjería
+  PASSPORT
+  PPT // permiso por protección temporal
+}
+
+enum AccessPurpose {
+  CLINICAL_REPORT // emitir informe con identificación del paciente
+  CRISIS_RESPONSE // contacto ante bandera roja con consentimiento
+  ACCOUNT_RECOVERY
+  DATA_SUBJECT_REQUEST // derechos ARCO / RGPD (acceso, rectificación, supresión)
+  LEGAL_OBLIGATION
+}
+
+model Identity {
+  /// = User.id en la base de salud.
+  subjectId          String   @id @default(uuid())
+  /// HMAC-SHA256(correo normalizado) con llave de la bóveda: permite buscar
+  /// sin almacenar el correo en claro.
+  emailBlindIndex    String   @unique
+  emailCiphertext    String
+  fullNameCiphertext String
+  documentType       DocumentType?
+  documentBlindIndex String?  @unique
+  documentCiphertext String?
+  phoneCiphertext    String?
+  birthDateCiphertext String
+  /// Versión de la llave de datos (rotación de llaves sin re-cifrado masivo inmediato).
+  keyVersion         Int      @default(1)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  /// Supresión (derecho al olvido): se borra la PII y se conserva solo el
+  /// subjectId para no romper la integridad del estudio (dato anónimo).
+  erasedAt           DateTime?
+
+  guardian  Guardian?
+  accessLog IdentityAccessLog[]
+
+  @@map("identities")
+}
+
+/// Acudiente de participantes menores de edad.
+model Guardian {
+  id                 String   @id @default(uuid())
+  subjectId          String   @unique
+  fullNameCiphertext String
+  documentCiphertext String
+  phoneCiphertext    String
+  relationship       String
+
+  identity Identity @relation(fields: [subjectId], references: [subjectId], onDelete: Cascade)
+
+  @@map("guardians")
+}
+
+/// Bitácora inmutable (append-only) de cada acceso a PII.
+model IdentityAccessLog {
+  id          String        @id @default(uuid())
+  subjectId   String
+  accessedBy  String // UUID del profesional o servicio
+  purpose     AccessPurpose
+  /// Referencia al objeto que justifica el acceso (p. ej. id de ClinicalExport o RedFlagEvent).
+  justificationRef String?
+  accessedAt  DateTime      @default(now())
+
+  identity Identity @relation(fields: [subjectId], references: [subjectId])
+
+  @@index([subjectId, accessedAt])
+  @@map("identity_access_log")
+}

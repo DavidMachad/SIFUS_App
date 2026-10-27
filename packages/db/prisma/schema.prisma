@@ -1,0 +1,1207 @@
+// =============================================================================
+// SIFUS · Esquema operacional (OLTP)
+// Semillero de Investigación en Funcionalidad, Movimiento y Salud
+//
+// Principios de diseño:
+//  1. La salud es bienestar físico, mental, social y espiritual, no solo
+//     ausencia de enfermedad. Por eso los instrumentos psicosociales y
+//     espirituales tienen el mismo rango estructural que los físicos.
+//  2. La vulnerabilidad es punto de partida, no falta. Ningún campo modela
+//     "castigos": las misiones no completadas quedan como SKIPPED, sin pérdida
+//     de XP ni de racha.
+//  3. Rigor longitudinal: cada medición guarda fase (BASELINE, MONTH_1,
+//     MONTH_2...), protocolo, versión del instrumento y versión del algoritmo
+//     de puntuación. Así cualquier dato se puede reproducir y auditar.
+//  4. Privacidad por diseño (Ley 1581 de 2012, Resolución 8430 de 1993;
+//     diseñado además contra HIPAA y RGPD, ver docs/SECURITY.md):
+//     - Este esquema NO contiene PII. Nombre, correo, documento, teléfono y
+//       fecha de nacimiento exacta viven en la Bóveda de Identidad
+//       (packages/identity-vault), otra base de datos con otras credenciales y
+//       otras llaves. El único enlace es User.id, un UUID v4 sin significado.
+//     - El texto libre sensible (bitácora, notas clínicas) se guarda cifrado con
+//       AES-256-GCM a nivel de aplicación (campos *Ciphertext).
+//     - La analítica usa un TERCER identificador (researchCode), de modo que ni
+//       siquiera el UUID operacional llega al esquema de investigación.
+//
+// Las tablas se nombran en snake_case (@@map) para facilitar el ETL hacia el
+// esquema estrella "analytics" (ver ../sql/analytics).
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS · Identidad y contexto
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  PARTICIPANT
+  EVALUATOR // profesional que toma medidas presenciales (antropometría, FMS...)
+  RESEARCHER // acceso de solo lectura al esquema analytics (datos seudonimizados)
+  ADMIN
+}
+
+/// Sexo registrado. Solo se usa para ecuaciones de referencia (p. ej. % grasa,
+/// valores normativos de prensión). La identidad de género es un campo aparte
+/// y opcional; nunca se infiere una de la otra.
+enum SexForReference {
+  FEMALE
+  MALE
+  INTERSEX
+  UNDISCLOSED
+}
+
+/// Entorno donde se implementa la intervención (determinante social).
+enum ImplementationSetting {
+  EDUCATIONAL
+  WORKPLACE
+  COMMUNITY
+  HEALTHCARE
+}
+
+enum ConsentScope {
+  APP_ONLY // usa la app, sus datos NO entran al dataset de investigación
+  RESEARCH_DEIDENTIFIED // datos seudonimizados disponibles para el estudio SIFUS
+}
+
+/// Filtro de espiritualidad/propósito: adapta instrumentos, lenguaje de
+/// misiones y preguntas de la bitácora (ver @sifus/core/spirituality).
+enum SpiritualOrientation {
+  THEOLOGICAL
+  MINDFULNESS
+  NATURE
+  SECULAR_PURPOSE
+}
+
+enum SmokingStatus {
+  NEVER
+  FORMER
+  CURRENT
+  UNDISCLOSED
+}
+
+enum InjuryStatus {
+  ACTIVE // limita el movimiento hoy
+  RECOVERING
+  RESOLVED
+}
+
+enum BodyRegion {
+  NECK
+  SHOULDER
+  ELBOW
+  WRIST_HAND
+  UPPER_BACK
+  LOWER_BACK
+  HIP
+  KNEE
+  ANKLE_FOOT
+  OTHER
+}
+
+enum PassiveMetric {
+  HRV_RMSSD_MS
+  HRV_SDNN_MS
+  RESTING_HR_BPM
+  STEPS
+  SLEEP_ASLEEP_MIN
+  SLEEP_DEEP_MIN
+  SLEEP_REM_MIN
+  SLEEP_AWAKE_MIN
+  SLEEP_IN_BED_MIN
+}
+
+enum PassivePlatform {
+  APPLE_HEALTH
+  HEALTH_CONNECT
+  MANUAL_DEVICE
+}
+
+enum RedFlagLevel {
+  NONE
+  WATCH
+  ELEVATED
+  CRISIS
+}
+
+enum GamificationMode {
+  FULL
+  GENTLE
+  PAUSED
+}
+
+enum ExportFormat {
+  PDF_CLINICAL_REPORT
+  FHIR_R4_BUNDLE
+}
+
+enum AvatarArchetype {
+  // Arquetipos narrativos, sin connotación de forma corporal ni de rendimiento.
+  EXPLORER // Explorador/a: curiosidad, movimiento en la naturaleza
+  GUARDIAN // Guardián/a: cuidado de otros, constancia
+  SAGE // Sabio/a: autoconocimiento, respiración, calma
+  ARTISAN // Artesano/a: técnica, coordinación, precisión
+  WAYFARER // Caminante: resistencia, paso a paso
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS · Anamnesis
+// -----------------------------------------------------------------------------
+
+enum TrainingExperience {
+  NONE
+  BEGINNER // < 6 meses
+  INTERMEDIATE // 6 meses – 2 años
+  ADVANCED // > 2 años de entrenamiento sistemático
+}
+
+enum TrainingModality {
+  STRENGTH_TRAINING // musculación
+  CALISTHENICS
+  FUNCTIONAL
+  CARDIO_ENDURANCE
+  SPORTS
+  DANCE
+  YOGA_PILATES
+  WALKING
+  OTHER
+}
+
+/// Secciones sensibles de la historia que se completan como "misiones
+/// secundarias" (reducen la fricción del onboarding).
+enum ProfileSideQuestKey {
+  MEDICAL_CONDITIONS
+  MEDICATIONS
+  SURGICAL_HISTORY
+  INJURY_HISTORY
+  FOOD_AVERSIONS
+  HORMONAL_CONTRACEPTION
+  MENSTRUAL_CYCLE
+  BODY_COMPOSITION
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS · Evaluaciones (Tests)
+// -----------------------------------------------------------------------------
+
+/// Quién tomó las medidas. Solo EVALUATOR entra a la línea de base analítica;
+/// el autorreporte del onboarding sirve para personalizar el juego desde el
+/// día 1, sin contaminar la evidencia.
+enum MeasurementSource {
+  EVALUATOR
+  SELF_REPORTED
+}
+
+enum AssessmentPhase {
+  BASELINE
+  MONTH_1
+  MONTH_2
+  MONTH_3
+  MONTH_6
+  FOLLOW_UP
+}
+
+enum PerimeterSite {
+  CHEST
+  ARM_RELAXED
+  ARM_FLEXED_TENSED
+  WAIST // mínima / ISAK; se documenta el punto en Assessment.protocolVersion
+  HIP // máxima glútea
+  THIGH_MID
+  CALF_MAX
+}
+
+enum BodySide {
+  LEFT
+  RIGHT
+  NOT_APPLICABLE
+}
+
+enum BodyFatMethod {
+  BIA // bioimpedancia
+  SKINFOLDS // pliegues + ecuación (registrar ecuación en equationName)
+  DXA
+  OTHER
+}
+
+/// Los siete patrones del Functional Movement Screen (Cook et al.).
+enum FmsPattern {
+  DEEP_SQUAT
+  HURDLE_STEP
+  INLINE_LUNGE
+  SHOULDER_MOBILITY
+  ACTIVE_STRAIGHT_LEG_RAISE
+  TRUNK_STABILITY_PUSH_UP
+  ROTARY_STABILITY
+}
+
+enum Hand {
+  LEFT
+  RIGHT
+}
+
+enum StrengthExercise {
+  DEEP_SQUAT // sentadilla profunda
+  BENCH_PRESS // press de banca
+  DEADLIFT
+  OVERHEAD_PRESS
+  BENT_OVER_ROW
+  LEG_PRESS
+}
+
+enum StrengthTestProtocol {
+  DIRECT_1RM
+  DIRECT_5RM
+  ESTIMATED_FROM_SUBMAX // carga submáxima × repeticiones → ecuación
+}
+
+enum OneRmFormula {
+  BRZYCKI
+  EPLEY
+  LOMBARDI
+  NONE // prueba directa
+}
+
+enum Instrument {
+  PSS_10 // Escala de Estrés Percibido (Cohen)
+  VIA_IS // Inventario VIA de Fortalezas (VIA-120 / VIA-72)
+  GHQ_12 // Cuestionario de Salud General (Goldberg)
+  MSPSS // Escala Multidimensional de Apoyo Social Percibido (Zimet)
+  WHOQOL_SRPB // Módulo OMS de Espiritualidad, Religiosidad y Creencias Personales
+  PIL // Purpose in Life (Crumbaugh & Maholick)
+  WHO_5 // Índice de Bienestar OMS-5
+  I_PANAS_SF // "Micro-PANAS": EMA diaria de afecto positivo/negativo
+  IPAQ_SF // Actividad física, versión corta
+  PSQI // Calidad del sueño de Pittsburgh
+  AIS // Escala Atenas de Insomnio
+  MEDAS // Adherencia a dieta mediterránea (adaptación local)
+  FACIT_SP_12 // Bienestar espiritual (12 u 8 ítems según orientación)
+  SWBS // Spiritual Well-Being Scale (licenciada)
+  JAREL // JAREL Spiritual Well-Being Scale (licenciada; puntuación pendiente)
+  SAFETY_SCREEN // Pregunta de seguridad del Protocolo de Banderas Rojas
+}
+
+/// Las 24 fortalezas del carácter de la clasificación VIA (Peterson & Seligman).
+enum ViaStrength {
+  CREATIVITY
+  CURIOSITY
+  JUDGMENT
+  LOVE_OF_LEARNING
+  PERSPECTIVE
+  BRAVERY
+  PERSEVERANCE
+  HONESTY
+  ZEST
+  LOVE
+  KINDNESS
+  SOCIAL_INTELLIGENCE
+  TEAMWORK
+  FAIRNESS
+  LEADERSHIP
+  FORGIVENESS
+  HUMILITY
+  PRUDENCE
+  SELF_REGULATION
+  APPRECIATION_OF_BEAUTY
+  GRATITUDE
+  HOPE
+  HUMOR
+  SPIRITUALITY
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS · Juego, misiones y gremios
+// -----------------------------------------------------------------------------
+
+/// Capacidades protectoras del Árbol de Habilidades Funcionales.
+enum FunctionalCapacity {
+  STRENGTH
+  ENDURANCE
+  MOBILITY
+  BALANCE
+  COORDINATION
+  AGILITY
+  PROPRIOCEPTION
+}
+
+/// Banda de disponibilidad del día que calcula el algoritmo de vulnerabilidad.
+enum ReadinessBand {
+  RECOVERY // Ruta de Recuperación: se cierran temporalmente alta y moderada intensidad
+  BALANCE // Ruta de Equilibrio: se cierra temporalmente la alta intensidad
+  EXPANSION // Ruta de Expansión: todo disponible dentro de la progresión del jugador
+}
+
+enum MissionIntensity {
+  RESTORATIVE // respiración, meditación, estiramiento suave (RPE 0–2)
+  LIGHT // caminata, movilidad articular (RPE 2–4)
+  MODERATE // circuito funcional (RPE 4–6)
+  HIGH // fuerza pesada, intervalos (RPE 7+)
+}
+
+enum MissionCategory {
+  RECOVERY
+  MINDFULNESS
+  FUNCTIONAL
+  STRENGTH
+  CONDITIONING
+  COMMUNITY
+  LORE
+}
+
+enum MissionSlot {
+  MAIN
+  RECOVERY
+  COMMUNITY
+  LORE
+}
+
+enum MissionStatus {
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  ADAPTED // la persona la ajustó a su realidad del día: cuenta como completada
+  SKIPPED // sin penalización; se usa solo para medir adherencia
+}
+
+enum XpSource {
+  MISSION
+  CHECK_IN // reportar cómo estás (incluida la vulnerabilidad) también suma
+  ASSESSMENT_MILESTONE
+  LORE_ENTRY
+  GUILD_QUEST
+  SIDE_QUEST
+}
+
+enum GuildType {
+  EDUCATIONAL
+  WORKPLACE
+  COMMUNITY
+  SHARED_BARRIER // personas que transitan barreras similares (anónimo por defecto)
+}
+
+enum GuildRole {
+  MEMBER
+  MENTOR // par con experiencia que acompaña
+  FACILITATOR // profesional SIFUS que modera
+}
+
+enum PurposeTheme {
+  FAMILY
+  HEALING
+  STRESS_RELEASE
+  SELF_CARE
+  COMMUNITY
+  FAITH_SPIRITUALITY
+  AUTONOMY
+  OTHER
+}
+
+enum LoreMoment {
+  BEFORE_TRAINING
+  AFTER_TRAINING
+  FREE
+}
+
+// =============================================================================
+// IDENTIDAD, CONSENTIMIENTO Y PERFIL DE JUGADOR
+// =============================================================================
+
+/// Sujeto seudónimo. id = subjectId (UUID v4) compartido SOLO con la Bóveda de
+/// Identidad. Sin correo, nombre ni documento: esos datos no existen aquí.
+model User {
+  id           String   @id @default(uuid())
+  role         UserRole @default(PARTICIPANT)
+  /// Código seudónimo (p. ej. "SIFUS-000123"). Es la ÚNICA llave que llega al
+  /// esquema analytics; nunca se exporta email ni nombre.
+  researchCode String   @unique
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  profile         PlayerProfile?
+  clinicalHistory ClinicalHistory?
+  consents        ResearchConsent[]
+  anamneses       Anamnesis[]
+  checkIns        DailyCheckIn[]
+  dailyPlans      DailyPlan[]
+  assessments     Assessment[]                  @relation("AssessmentParticipant")
+  evaluated       Assessment[]                  @relation("AssessmentEvaluator")
+  questionnaires  QuestionnaireAdministration[]
+  strengths       PlayerStrength[]
+  skills          SkillProgress[]
+  xpEvents        XpEvent[]
+  sideQuests      ProfileSideQuest[]
+  loreEntries     LoreEntry[]
+  memberships     GuildMembership[]
+  encouragements  GuildEncouragement[]          @relation("EncouragementSender")
+  injuries        InjuryRecord[]
+  passiveDays     PassiveDailySummary[]
+  indexSnapshots  WellbeingIndexSnapshot[]
+  redFlagEvents   RedFlagEvent[]
+  exports         ClinicalExport[]
+
+  @@map("users")
+}
+
+model ResearchConsent {
+  id                   String       @id @default(uuid())
+  userId               String
+  scope                ConsentScope
+  documentVersion      String // versión del consentimiento informado aprobado por el comité de ética
+  acceptedAt           DateTime     @default(now())
+  revokedAt            DateTime?
+  /// Menores: asentimiento del menor + consentimiento del acudiente. Los datos
+  /// del acudiente (PII) están en la Bóveda de Identidad.
+  guardianConsentAt    DateTime?
+  /// Autoriza avisar al equipo de cuidado ante banderas rojas ELEVATED/CRISIS.
+  allowsCareTeamAlerts Boolean      @default(true)
+  /// Autoriza compartir informes clínicos con profesionales que la persona elija.
+  allowsClinicalExport Boolean      @default(false)
+  /// Autoriza conectar Apple Health / Health Connect (datos pasivos).
+  allowsPassiveData    Boolean      @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, scope])
+  @@map("research_consents")
+}
+
+/// "Creador de Personaje": la cara lúdica del perfil.
+model PlayerProfile {
+  id                    String                @id @default(uuid())
+  userId                String                @unique
+  displayName           String
+  archetype             AvatarArchetype
+  /// Configuración visual libre (colores, accesorios). No incluye forma corporal.
+  avatarConfig          Json                  @default("{}")
+  /// Solo el año (criterio de-identificación HIPAA Safe Harbor). La fecha
+  /// exacta está en la Bóveda de Identidad.
+  birthYear             Int
+  sexForReference       SexForReference       @default(UNDISCLOSED)
+  genderIdentity        String?
+  setting               ImplementationSetting
+  /// Código DIVIPOLA (DANE) del municipio: permite análisis territorial.
+  municipalityCode      String?               @db.VarChar(5)
+  /// Mensaje propio de propósito ("¿Para qué me muevo?"), núcleo del Lore.
+  purposeStatement      String?
+  spiritualOrientation  SpiritualOrientation  @default(SECULAR_PURPOSE)
+  totalXp               Int                   @default(0)
+  playerLevel           Int                   @default(1)
+  /// Racha de coherencia: días alineados con el propósito. Tiene días de gracia:
+  /// no se rompe por un mal día.
+  coherenceStreak       Int                   @default(0)
+  graceDaysAvailable    Int                   @default(2)
+  onboardingCompletedAt DateTime?
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([setting, municipalityCode])
+  @@map("player_profiles")
+}
+
+// =============================================================================
+// ANAMNESIS
+// =============================================================================
+
+/// Anamnesis versionada: se registra en el onboarding y se actualiza en cada
+/// fase de valoración, de modo que el contexto de vida también tiene evolución.
+model Anamnesis {
+  id         String          @id @default(uuid())
+  userId     String
+  phase      AssessmentPhase @default(BASELINE)
+  recordedAt DateTime        @default(now())
+
+  // --- Contexto fisiológico ---
+  sleepHoursNight   Decimal  @db.Decimal(3, 1) // horas promedio de sueño nocturno
+  sleepQuality      Int? // 1 (muy mala) – 5 (muy buena)
+  /// Estrés percibido 1–10. Premisa del modelo: el cortisol sostenido alto
+  /// compromete la recuperación muscular; este valor alimenta el algoritmo de
+  /// vulnerabilidad (no es un diagnóstico; para eso existe el PSS-10).
+  perceivedStress   Int
+  waterIntakeLiters Decimal? @db.Decimal(3, 1)
+
+  // --- Historial de entrenamiento ---
+  trainingExperience  TrainingExperience
+  trainingMonths      Int? // tiempo total de práctica sistemática
+  weeklyFrequency     Int // sesiones por semana (0–14)
+  avgSessionMinutes   Int // tiempo promedio por sesión
+  preferredModalities TrainingModality[]
+  /// Barreras que la persona reconoce (tiempo, dinero, seguridad del entorno,
+  /// dolor, cuidado de otros...). Determinantes sociales, texto codificable.
+  perceivedBarriers   String[]
+
+  // --- Hábitos actuales ---
+  smokingStatus          SmokingStatus @default(UNDISCLOSED)
+  sittingHoursPerDay     Decimal?      @db.Decimal(3, 1)
+  screenMinutesBeforeBed Int?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, phase])
+  @@map("anamneses")
+}
+
+/// Historia clínica sensible. Tabla separada para aplicar control de acceso
+/// más estricto (solo el participante y el equipo evaluador asignado).
+/// Se completa por partes, como misiones secundarias.
+model ClinicalHistory {
+  id                        String    @id @default(uuid())
+  userId                    String    @unique
+  medicalConditions         String[]
+  medications               String[]
+  surgicalHistory           String[]
+  /// Notas libres cifradas (AES-256-GCM, sobre de @sifus/api/security).
+  notesCiphertext           String?
+  foodAversions             String[]
+  usesHormonalContraception Boolean?
+  /// Banderas de seguridad derivadas del PAR-Q+ u otro tamizaje; si alguna es
+  /// true, la alta intensidad requiere aval profesional.
+  requiresMedicalClearance  Boolean   @default(false)
+  clearanceGrantedAt        DateTime?
+  updatedAt                 DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("clinical_histories")
+}
+
+/// Lesiones estructuradas: alimentan el bloqueo de patrones de carga.
+model InjuryRecord {
+  id           String       @id @default(uuid())
+  userId       String
+  region       BodyRegion
+  side         BodySide     @default(NOT_APPLICABLE)
+  status       InjuryStatus
+  occurredYear Int?
+  hadSurgery   Boolean      @default(false)
+  /// Dolor actual 0–10 al moverse.
+  currentPain  Int?
+  reportedAt   DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@map("injury_records")
+}
+
+model ProfileSideQuest {
+  id          String              @id @default(uuid())
+  userId      String
+  key         ProfileSideQuestKey
+  completedAt DateTime            @default(now())
+  xpAwarded   Int                 @default(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@map("profile_side_quests")
+}
+
+/// Reporte diario breve (≤ 30 s). Es la entrada principal del algoritmo de
+/// Mapeo de Vulnerabilidad Activa.
+model DailyCheckIn {
+  id              String   @id @default(uuid())
+  userId          String
+  date            DateTime @db.Date
+  sleepHours      Decimal  @db.Decimal(3, 1)
+  sleepQuality    Int? // 1–5
+  perceivedStress Int // 1–10
+  mentalFatigue   Int? // 1–10
+  physicalFatigue Int? // 1–10
+  painLevel       Int? // 0–10 (escala numérica de dolor)
+  painRegion      String?
+  mood            Int? // 1–5
+  feelsIsolated   Boolean? // señal social: activa misiones de gremio
+  createdAt       DateTime @default(now())
+
+  user User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan DailyPlan?
+
+  @@unique([userId, date])
+  @@map("daily_check_ins")
+}
+
+// =============================================================================
+// TESTS · Sesiones de valoración e instrumentos
+// =============================================================================
+
+/// Sesión de valoración (contenedor de los "Tests"). Una por fase y persona;
+/// agrupa las pruebas físicas presenciales y, opcionalmente, los cuestionarios.
+model Assessment {
+  id              String            @id @default(uuid())
+  userId          String
+  evaluatorId     String?
+  phase           AssessmentPhase
+  assessedAt      DateTime
+  location        String?
+  /// Protocolo aplicado (p. ej. "SIFUS-PROT-v1.2 / ISAK nivel 1"); permite
+  /// comparar solo mediciones hechas con el mismo procedimiento.
+  source          MeasurementSource @default(EVALUATOR)
+  protocolVersion String
+  /// Condiciones que afectan la medición: ayuno, hora del día, ciclo menstrual,
+  /// actividad intensa en las 24 h previas, etc.
+  conditions      Json              @default("{}")
+  notes           String?
+  createdAt       DateTime          @default(now())
+
+  user           User                          @relation("AssessmentParticipant", fields: [userId], references: [id], onDelete: Cascade)
+  evaluator      User?                         @relation("AssessmentEvaluator", fields: [evaluatorId], references: [id])
+  anthropometry  AnthropometricRecord?
+  perimeters     PerimeterMeasurement[]
+  fmsScreen      FmsScreen?
+  dynamometry    DynamometryTest[]
+  flexibility    FlexibilityTest[]
+  strengthTests  StrengthTest[]
+  questionnaires QuestionnaireAdministration[]
+
+  @@unique([userId, phase, source])
+  @@index([phase, assessedAt])
+  @@map("assessments")
+}
+
+model AnthropometricRecord {
+  id            String         @id @default(uuid())
+  assessmentId  String         @unique
+  heightCm      Decimal        @db.Decimal(5, 1)
+  weightKg      Decimal        @db.Decimal(5, 2)
+  bodyFatPct    Decimal?       @db.Decimal(4, 1)
+  bodyFatMethod BodyFatMethod?
+  equationName  String? // p. ej. "Durnin-Womersley 1974" o modelo del equipo BIA
+
+  assessment Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+
+  @@map("anthropometric_records")
+}
+
+/// Perímetros corporales: una fila por sitio y lado. Se guardan las tomas
+/// individuales para poder calcular el error técnico de medida (ETM).
+model PerimeterMeasurement {
+  id           String        @id @default(uuid())
+  assessmentId String
+  site         PerimeterSite
+  side         BodySide      @default(NOT_APPLICABLE)
+  trialsCm     Decimal[]     @db.Decimal(5, 1)
+  /// Valor final: media de 2 tomas o mediana de 3 (criterio ISAK).
+  valueCm      Decimal       @db.Decimal(5, 1)
+
+  assessment Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+
+  @@unique([assessmentId, site, side])
+  @@map("perimeter_measurements")
+}
+
+model FmsScreen {
+  id             String  @id @default(uuid())
+  assessmentId   String  @unique
+  totalScore     Int // 0–21, calculado con @sifus/core/instruments/fms
+  hasAsymmetry   Boolean
+  hasPain        Boolean
+  scoringVersion String
+
+  assessment Assessment        @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  patterns   FmsPatternScore[]
+
+  @@map("fms_screens")
+}
+
+model FmsPatternScore {
+  id               String     @id @default(uuid())
+  screenId         String
+  pattern          FmsPattern
+  leftScore        Int? // 0–3 en patrones bilaterales
+  rightScore       Int?
+  singleScore      Int? // DEEP_SQUAT y TRUNK_STABILITY_PUSH_UP
+  /// Dolor en la prueba de despeje asociada (hombro, extensión o flexión
+  /// espinal): fuerza la puntuación final a 0.
+  clearingTestPain Boolean    @default(false)
+  finalScore       Int // el menor de ambos lados, o 0 si hubo dolor
+
+  screen FmsScreen @relation(fields: [screenId], references: [id], onDelete: Cascade)
+
+  @@unique([screenId, pattern])
+  @@map("fms_pattern_scores")
+}
+
+/// Dinamometría de prensión manual.
+model DynamometryTest {
+  id           String    @id @default(uuid())
+  assessmentId String
+  hand         Hand
+  isDominant   Boolean
+  trialsKg     Decimal[] @db.Decimal(4, 1)
+  bestKg       Decimal   @db.Decimal(4, 1)
+  device       String? // p. ej. "Jamar hidráulico", "Camry digital"
+  protocol     String    @default("Southampton") // postura y nº de intentos
+
+  assessment Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+
+  @@unique([assessmentId, hand])
+  @@map("dynamometry_tests")
+}
+
+/// Test de flexibilidad de Wells & Dillon (sit-and-reach con cajón).
+model FlexibilityTest {
+  id           String    @id @default(uuid())
+  assessmentId String
+  testName     String    @default("WELLS_DILLON")
+  trialsCm     Decimal[] @db.Decimal(4, 1)
+  bestCm       Decimal   @db.Decimal(4, 1)
+  /// Posición del cero respecto a la línea de los pies (en el cajón clásico
+  /// la línea de los pies queda en 23 o 26 cm según el fabricante). Sin este
+  /// dato, los valores de distintos cajones no son comparables.
+  footLineAtCm Decimal   @db.Decimal(4, 1)
+
+  assessment Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+
+  @@map("flexibility_tests")
+}
+
+/// Pruebas de fuerza máxima: 1RM/5RM directas o estimadas.
+model StrengthTest {
+  id             String               @id @default(uuid())
+  assessmentId   String
+  exercise       StrengthExercise
+  protocol       StrengthTestProtocol
+  loadKg         Decimal              @db.Decimal(5, 1)
+  reps           Int
+  formula        OneRmFormula         @default(NONE)
+  estimated1RmKg Decimal              @db.Decimal(5, 1)
+  rpe            Decimal?             @db.Decimal(3, 1) // esfuerzo percibido de la serie
+  /// Si la técnica no fue válida (p. ej. sentadilla sin profundidad), el dato
+  /// se conserva pero se excluye del análisis.
+  techniqueValid Boolean              @default(true)
+
+  assessment Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+
+  @@index([assessmentId, exercise])
+  @@map("strength_tests")
+}
+
+/// Aplicación de un cuestionario validado (PSS-10, GHQ-12, MSPSS, WHOQOL-SRPB,
+/// VIA-IS, PIL). Se guardan las respuestas por ítem para poder re-puntuar si
+/// cambia el método de calificación.
+model QuestionnaireAdministration {
+  id                String           @id @default(uuid())
+  userId            String
+  assessmentId      String? // null si se respondió dentro de la app fuera de una sesión presencial
+  phase             AssessmentPhase?
+  instrument        Instrument
+  /// Versión y adaptación validada (p. ej. "PSS-10 es-CO, Campo-Arias 2009").
+  instrumentVersion String
+  language          String           @default("es-CO")
+  itemResponses     Json // { "1": 3, "2": 1, ... } con la codificación original
+  totalScore        Decimal?         @db.Decimal(6, 2)
+  /// Subescalas, p. ej. MSPSS { family, friends, significantOther } o facetas SRPB.
+  subscaleScores    Json?
+  scoringMethod     String // p. ej. "GHQ 0-0-1-1" vs "Likert 0-3"
+  scoringVersion    String // versión del código de puntuación en @sifus/core
+  startedAt         DateTime?
+  completedAt       DateTime         @default(now())
+
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assessment Assessment?        @relation(fields: [assessmentId], references: [id], onDelete: SetNull)
+  viaScores  ViaStrengthScore[]
+
+  @@index([userId, instrument, completedAt])
+  @@map("questionnaire_administrations")
+}
+
+model ViaStrengthScore {
+  id               String      @id @default(uuid())
+  administrationId String
+  strength         ViaStrength
+  score            Decimal     @db.Decimal(3, 2) // media 1–5
+  rank             Int // 1 = fortaleza más característica
+
+  administration QuestionnaireAdministration @relation(fields: [administrationId], references: [id], onDelete: Cascade)
+
+  @@unique([administrationId, strength])
+  @@map("via_strength_scores")
+}
+
+// =============================================================================
+// JUEGO · Fortalezas, árbol de habilidades y XP
+// =============================================================================
+
+/// Fortalezas "equipadas" como habilidades pasivas: moldean el tono con el que
+/// la app se comunica con la persona.
+model PlayerStrength {
+  id         String      @id @default(uuid())
+  userId     String
+  strength   ViaStrength
+  fromVia    Boolean     @default(false) // true: proviene del VIA-IS; false: autoseleccionada
+  equippedAt DateTime    @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, strength])
+  @@map("player_strengths")
+}
+
+model SkillProgress {
+  id                  String             @id @default(uuid())
+  userId              String
+  capacity            FunctionalCapacity
+  /// XP por práctica (misiones). Nunca disminuye.
+  xp                  Int                @default(0)
+  level               Int                @default(1)
+  /// Hitos validados por evaluación presencial (mejora > cambio mínimo
+  /// detectable respecto a la propia línea de base).
+  evaluatedMilestones Int                @default(0)
+  lastMilestoneAt     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, capacity])
+  @@map("skill_progress")
+}
+
+/// Libro mayor de XP (append-only): permite auditar la economía del juego y
+/// analizar qué tipo de actividad sostiene la adherencia.
+model XpEvent {
+  id        String              @id @default(uuid())
+  userId    String
+  source    XpSource
+  sourceId  String?
+  capacity  FunctionalCapacity?
+  amount    Int
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("xp_events")
+}
+
+// =============================================================================
+// DAILY MISSIONS
+// =============================================================================
+
+/// Catálogo de misiones, curado por el equipo SIFUS.
+model MissionTemplate {
+  id                String           @id @default(uuid())
+  code              String           @unique // p. ej. "REC_JOINT_MOBILITY_10"
+  title             String
+  description       String
+  category          MissionCategory
+  intensity         MissionIntensity
+  durationMinutes   Int
+  /// Reparto de XP por capacidad: { "MOBILITY": 20, "BALANCE": 10 }
+  capacityXp        Json
+  /// Patrones FMS que reciben carga: si alguno es doloroso, la misión se bloquea.
+  loadedPatterns    FmsPattern[]
+  minAgeYears       Int?
+  maxAgeYears       Int?
+  contraindications String?
+  active            Boolean          @default(true)
+  version           Int              @default(1)
+
+  assignments DailyMission[]
+
+  @@map("mission_templates")
+}
+
+/// Plan del día: salida auditada del algoritmo de vulnerabilidad.
+model DailyPlan {
+  id                 String             @id @default(uuid())
+  userId             String
+  date               DateTime           @db.Date
+  checkInId          String?            @unique
+  band               ReadinessBand
+  loadScore          Decimal            @db.Decimal(4, 1)
+  rpeCap             Int // techo de esfuerzo percibido (escala CR-10)
+  blockedIntensities MissionIntensity[]
+  reasonCodes        String[] // p. ej. ["SLEEP_DEBT_SEVERE", "HIGH_STRESS"]
+  safetyFlags        String[] // p. ej. ["PAIN_CONSULT_PROFESSIONAL"]
+  /// Versión del algoritmo + snapshot de entradas: permite reproducir cualquier
+  /// decisión y evaluar el algoritmo como parte de la intervención.
+  algorithmVersion   String
+  inputSnapshot      Json
+  createdAt          DateTime           @default(now())
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  checkIn  DailyCheckIn?  @relation(fields: [checkInId], references: [id])
+  missions DailyMission[]
+
+  @@unique([userId, date])
+  @@index([band, date])
+  @@map("daily_plans")
+}
+
+model DailyMission {
+  id             String        @id @default(uuid())
+  planId         String
+  templateId     String
+  slot           MissionSlot
+  status         MissionStatus @default(ASSIGNED)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  reportedRpe    Int? // 0–10
+  actualMinutes  Int?
+  xpAwarded      Int           @default(0)
+  adaptationNote String?
+
+  plan      DailyPlan       @relation(fields: [planId], references: [id], onDelete: Cascade)
+  template  MissionTemplate @relation(fields: [templateId], references: [id])
+  loreEntry LoreEntry?
+
+  @@index([status, completedAt])
+  @@map("daily_missions")
+}
+
+// =============================================================================
+// BITÁCORA ESPIRITUAL (LORE)
+// =============================================================================
+
+model LoreEntry {
+  id                String                @id @default(uuid())
+  userId            String
+  dailyMissionId    String?               @unique
+  moment            LoreMoment
+  promptCode        String // pregunta mostrada (catálogo versionado)
+  purposeTheme      PurposeTheme
+  /// Reflexión y gratitud en texto libre, CIFRADAS (AES-256-GCM, AAD = id del
+  /// usuario + campo). Nunca se exportan a analytics: solo viajan tema,
+  /// coherencia, fortalezas y si hubo gratitud.
+  contentCiphertext String?
+  hasGratitude      Boolean               @default(false)
+  /// Logro físico al que se vincula la reflexión (p. ej. "LEVEL_UP:MOBILITY:3").
+  achievementRef    String?
+  orientation       SpiritualOrientation?
+  /// "¿Qué tan coherente fue hoy tu movimiento con tu propósito?" 1–5
+  coherenceRating   Int
+  strengthsUsed     ViaStrength[]
+  createdAt         DateTime              @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dailyMission DailyMission? @relation(fields: [dailyMissionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@map("lore_entries")
+}
+
+// =============================================================================
+// GUILDS (Apoyo comunitario)
+// =============================================================================
+
+model Guild {
+  id                 String                @id @default(uuid())
+  name               String
+  type               GuildType
+  setting            ImplementationSetting
+  description        String?
+  /// En gremios de barrera compartida los miembros se ven solo por alias.
+  anonymousByDefault Boolean               @default(false)
+  municipalityCode   String?               @db.VarChar(5)
+  maxMembers         Int                   @default(12)
+  createdAt          DateTime              @default(now())
+
+  memberships    GuildMembership[]
+  quests         GuildQuest[]
+  encouragements GuildEncouragement[]
+
+  @@index([type, setting])
+  @@map("guilds")
+}
+
+model GuildMembership {
+  id       String    @id @default(uuid())
+  guildId  String
+  userId   String
+  role     GuildRole @default(MEMBER)
+  /// Recomendación de @sifus/core/guilds (perfil MSPSS + razón), para evaluar
+  /// después si el emparejamiento sostuvo el apoyo social percibido.
+  matchSnapshot Json?
+  alias    String? // nombre visible cuando el gremio es anónimo
+  joinedAt DateTime  @default(now())
+  leftAt   DateTime?
+
+  guild         Guild                    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  user          User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contributions GuildQuestContribution[]
+
+  @@unique([guildId, userId])
+  @@map("guild_memberships")
+}
+
+/// Meta colectiva: el gremio avanza junto, nadie compite contra nadie.
+model GuildQuest {
+  id          String    @id @default(uuid())
+  guildId     String
+  title       String
+  /// Métrica agregada, p. ej. "ACTIVE_MINUTES", "RECOVERY_MISSIONS", "LORE_ENTRIES"
+  metric      String
+  targetValue Int
+  startsAt    DateTime
+  endsAt      DateTime
+  completedAt DateTime?
+
+  guild         Guild                    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  contributions GuildQuestContribution[]
+
+  @@index([guildId, endsAt])
+  @@map("guild_quests")
+}
+
+model GuildQuestContribution {
+  id           String   @id @default(uuid())
+  questId      String
+  membershipId String
+  value        Int
+  createdAt    DateTime @default(now())
+
+  quest      GuildQuest      @relation(fields: [questId], references: [id], onDelete: Cascade)
+  membership GuildMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@index([questId])
+  @@map("guild_quest_contributions")
+}
+
+/// Mensajes de ánimo predefinidos (sin texto libre → entorno seguro).
+model GuildEncouragement {
+  id          String   @id @default(uuid())
+  guildId     String
+  senderId    String
+  recipientId String? // null = para todo el gremio
+  messageCode String // catálogo: "PROUD_OF_YOU", "REST_IS_PROGRESS", ...
+  createdAt   DateTime @default(now())
+
+  guild  Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  sender User  @relation("EncouragementSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([guildId, createdAt])
+  @@map("guild_encouragements")
+}
+
+// =============================================================================
+// DATOS PASIVOS (Apple Health / Health Connect)
+// =============================================================================
+
+/// Resumen diario por métrica. Minimización de datos (RGPD art. 5.1.c): las
+/// muestras crudas (latido a latido, fases minuto a minuto) se agregan EN EL
+/// DISPOSITIVO y nunca se suben; aquí solo llega el agregado diario.
+model PassiveDailySummary {
+  id          String          @id @default(uuid())
+  userId      String
+  date        DateTime        @db.Date
+  metric      PassiveMetric
+  value       Decimal         @db.Decimal(8, 2)
+  sampleCount Int
+  platform    PassivePlatform
+  /// Modelo de dispositivo: los algoritmos de sueño/HRV difieren entre marcas.
+  deviceModel String?
+  syncedAt    DateTime        @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date, metric])
+  @@index([metric, date])
+  @@map("passive_daily_summaries")
+}
+
+// =============================================================================
+// ÍNDICE DE VIDA CONSOLIDADO Y VALIDACIÓN CRUZADA
+// =============================================================================
+
+model WellbeingIndexSnapshot {
+  id                    String   @id @default(uuid())
+  userId                String
+  date                  DateTime @db.Date
+  /// null cuando status = INSUFFICIENT_DATA (nunca se inventa un número).
+  index                 Int?
+  status                String
+  mindScore             Decimal? @db.Decimal(4, 1)
+  bodyScore             Decimal? @db.Decimal(4, 1)
+  restorationScore      Decimal? @db.Decimal(4, 1)
+  lifestyleScore        Decimal? @db.Decimal(4, 1)
+  purposeScore          Decimal? @db.Decimal(4, 1)
+  /// Detalle por componente (valor normalizado, peso efectivo, faltantes).
+  breakdown             Json
+  confidence            Decimal  @db.Decimal(3, 2)
+  selfReportReliability Decimal  @db.Decimal(3, 2)
+  consistencyFlags      String[]
+  version               String
+  createdAt             DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@map("wellbeing_index_snapshots")
+}
+
+// =============================================================================
+// PROTOCOLO DE BANDERAS ROJAS
+// =============================================================================
+
+/// Registro auditable de cada activación. Es información clínica sensible:
+/// acceso restringido al equipo de cuidado asignado.
+model RedFlagEvent {
+  id                      String           @id @default(uuid())
+  userId                  String
+  openedAt                DateTime         @default(now())
+  level                   RedFlagLevel
+  triggers                String[]
+  gamificationMode        GamificationMode
+  protocolVersion         String
+  careTeamNotifiedAt      DateTime?
+  /// Primer contacto humano (no automatizado) con la persona.
+  professionalContactAt   DateTime?
+  followUpNotesCiphertext String?
+  resolvedAt              DateTime?
+  resolution              String? // p. ej. "REFERRED_TO_EPS", "SUPPORTED_AND_STABLE"
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([level, resolvedAt])
+  @@index([userId, openedAt])
+  @@map("red_flag_events")
+}
+
+// =============================================================================
+// RIGOR CLÍNICO: NORMAS, TERMINOLOGÍA Y EXPORTACIONES
+// =============================================================================
+
+/// Normas poblacionales cargadas por el equipo (con su cita) para expresar
+/// percentiles en el informe clínico. Sin norma aplicable no hay percentil.
+model ReferenceNorm {
+  id          String   @id @default(uuid())
+  measureCode String
+  sex         String // FEMALE | MALE | ANY
+  ageMin      Int
+  ageMax      Int
+  /// { kind: "NORMAL", mean, sd } | { kind: "PERCENTILE_TABLE", points: [...] }
+  method      Json
+  citation    String
+  population  String // p. ej. "Adultos colombianos, ENSIN 2015"
+  loadedAt    DateTime @default(now())
+
+  @@index([measureCode, sex, ageMin, ageMax])
+  @@map("reference_norms")
+}
+
+/// Auditoría de cada informe PDF o paquete FHIR generado.
+model ClinicalExport {
+  id          String       @id @default(uuid())
+  userId      String
+  format      ExportFormat
+  /// Quién lo solicitó (UUID de un profesional o del propio participante).
+  requestedBy String
+  recipient   String? // institución o profesional destinatario (sin PII del paciente)
+  periodFrom  DateTime     @db.Date
+  periodTo    DateTime     @db.Date
+  /// SHA-256 del documento emitido: permite verificar integridad sin guardarlo.
+  sha256      String
+  createdAt   DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("clinical_exports")
+}

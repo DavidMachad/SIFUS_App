@@ -1,0 +1,23 @@
+{
+  "name": "sifus-app",
+  "private": true,
+  "description": "SIFUS — aplicación de bienestar integral gamificada (Semillero de Investigación en Funcionalidad, Movimiento y Salud)",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "test": "npm run test --workspace @sifus/core && npm run test --workspace @sifus/mobile && npm run test --workspace @sifus/api",
+    "typecheck": "npm run typecheck --workspace @sifus/core --workspace @sifus/api --workspace @sifus/mobile",
+    "db:validate": "npm run validate --workspace @sifus/db",
+    "db:migrate": "npm run migrate --workspace @sifus/db",
+    "db:seed": "npm run seed --workspace @sifus/db",
+    "analytics:apply": "npm run analytics:apply --workspace @sifus/db",
+    "analytics:refresh": "psql \"$DATABASE_URL\" -c 'CALL analytics.refresh_all()'",
+    "test:integration": "npm run test --workspace @sifus/api -- test/integration.test.ts",
+    "vault:migrate": "npm run migrate --workspace @sifus/identity-vault"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
