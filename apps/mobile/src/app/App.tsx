@@ -1,11 +1,18 @@
 import React, { useState } from 'react';
-import { SafeAreaView, Text } from 'react-native';
+import { SafeAreaView } from 'react-native';
+import { computeWellbeingIndex, resourcesFor, type GamificationMode } from '@sifus/core';
+import { AvatarDashboardScreen } from '../features/dashboard/AvatarDashboardScreen';
 import { CharacterCreatorScreen } from '../features/onboarding/CharacterCreatorScreen';
 import type { OnboardingPayload } from '../features/onboarding/state/payload';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000';
+/**
+ * Sin EXPO_PUBLIC_API_URL la app corre en MODO DEMO LOCAL: no envía datos a
+ * ningún servidor y calcula todo en el dispositivo con @sifus/core.
+ */
+const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
 async function submitOnboarding(payload: OnboardingPayload): Promise<void> {
+  if (!API_URL) return;
   const res = await fetch(`${API_URL}/onboarding`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -15,14 +22,33 @@ async function submitOnboarding(payload: OnboardingPayload): Promise<void> {
 }
 
 export default function App() {
-  const [done, setDone] = useState(false);
+  const [player, setPlayer] = useState<OnboardingPayload | null>(null);
+  const [mode, setMode] = useState<GamificationMode>('FULL');
+  const [crisis, setCrisis] = useState(false);
+
+  if (!player) {
+    return (
+      <SafeAreaView style={{ flex: 1 }}>
+        <CharacterCreatorScreen onComplete={async (p) => { await submitOnboarding(p); setPlayer(p); }} />
+      </SafeAreaView>
+    );
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  // Recién creado el personaje aún no hay instrumentos: el índice queda "por descubrir".
+  const index = computeWellbeingIndex([], { date: today, ageYears: Number(today.slice(0, 4)) - player.profile.birthYear });
+
   return (
     <SafeAreaView style={{ flex: 1 }}>
-      {done ? (
-        <Text style={{ padding: 24, fontSize: 18 }}>¡Tu aventura comienza hoy! (Siguiente: pantalla de Misiones del Día)</Text>
-      ) : (
-        <CharacterCreatorScreen onComplete={async (p) => { await submitOnboarding(p); setDone(true); }} />
-      )}
+      <AvatarDashboardScreen
+        player={{ name: player.profile.displayName, archetype: player.profile.archetype }}
+        index={index}
+        safety={{ mode, crisis, resources: mode === 'PAUSED' ? resourcesFor() : [], requiresSafetyScreen: false }}
+        onRequestHelp={() => { setMode('PAUSED'); setCrisis(true); }}
+        onContactCareTeam={() => undefined}
+        onSafetyAnswer={() => undefined}
+        onStartQuest={() => undefined}
+      />
     </SafeAreaView>
   );
 }
