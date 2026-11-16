@@ -88,10 +88,13 @@ INSERT INTO questionnaire_administrations (id, "userId", "assessmentId", phase, 
 INSERT INTO via_strength_scores (id, "administrationId", strength, score, rank) VALUES
   ('v1','q11','CURIOSITY',4.6,1), ('v2','q11','TEAMWORK',4.4,2);
 
+-- Misiones usadas por la demo. Si el catálogo ya se sembró (npm run db:seed),
+-- se reutilizan las existentes por su código.
 INSERT INTO mission_templates (id, code, title, description, category, intensity, "durationMinutes", "capacityXp", "loadedPatterns") VALUES
   ('mt1','REC_JOINT_MOBILITY_10','Ritual de articulaciones','-','RECOVERY','LIGHT',10,'{"MOBILITY":25}','{}'),
   ('mt2','STR_FULL_BODY_30','Forja exprés','-','STRENGTH','HIGH',30,'{"STRENGTH":30}','{DEEP_SQUAT}'),
-  ('mt3','LORE_PURPOSE_CHECK_2','Bitácora','-','LORE','RESTORATIVE',2,'{}','{}');
+  ('mt3','LORE_PURPOSE_CHECK_2','Bitácora','-','LORE','RESTORATIVE',2,'{}','{}')
+ON CONFLICT (code) DO NOTHING;
 
 -- 60 días de check-ins y planes para u1 y u2.
 INSERT INTO daily_check_ins (id, "userId", date, "sleepHours", "perceivedStress", mood)
@@ -107,7 +110,9 @@ SELECT 'pl-' || c.id, c."userId", c.date, c.id,
 FROM daily_check_ins c;
 
 INSERT INTO daily_missions (id, "planId", "templateId", slot, status, "xpAwarded")
-SELECT 'dm-' || p.id, p.id, CASE WHEN p.band = 'EXPANSION' THEN 'mt2' ELSE 'mt1' END, 'MAIN',
+SELECT 'dm-' || p.id, p.id,
+       (SELECT t.id FROM mission_templates t WHERE t.code = CASE WHEN p.band = 'EXPANSION' THEN 'STR_FULL_BODY_30' ELSE 'REC_JOINT_MOBILITY_10' END),
+       'MAIN',
        (CASE WHEN extract(dow FROM p.date) IN (0, 6) THEN 'SKIPPED' ELSE 'COMPLETED' END)::"MissionStatus", 30
 FROM daily_plans p;
 
