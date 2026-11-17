@@ -18,6 +18,10 @@ interface Props {
   onContactCareTeam: () => void;
   onSafetyAnswer: (v: 0 | 1 | 2 | 3 | 'DECLINED') => void;
   onStartQuest: (key: string) => void;
+  /** Contenido extra al final (p. ej. el equipo de Aurora). */
+  footer?: React.ReactNode;
+  /** Si la pantalla contenedora ya muestra el botón de ayuda. */
+  hideHelpButton?: boolean;
 }
 
 /**
@@ -31,7 +35,7 @@ export function AvatarDashboardScreen(p: Props) {
 
   return (
     <ScrollView contentContainerStyle={styles.root}>
-      <HelpButton onPress={p.onRequestHelp} />
+      {!p.hideHelpButton && <HelpButton onPress={p.onRequestHelp} />}
 
       {view.mode === 'SUPPORT' ? (
         <>
@@ -71,6 +75,7 @@ export function AvatarDashboardScreen(p: Props) {
           {p.index && p.index.confidence < 0.6 && view.bar.value !== null && (
             <Text style={styles.confidence}>Tu barra se basa en información parcial ({Math.round(p.index.confidence * 100)} %). Se vuelve más precisa con cada misión de evaluación.</Text>
           )}
+          {p.footer}
         </>
       )}
     </ScrollView>

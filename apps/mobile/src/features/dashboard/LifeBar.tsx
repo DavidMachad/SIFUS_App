@@ -21,7 +21,7 @@ export function LifeBar({ value, tone, caption }: { value: number | null; tone: 
       accessibilityValue={value === null ? { text: 'Por descubrir' } : { min: 0, max: 100, now: value }}
     >
       <View style={styles.row}>
-        <Text style={styles.title}>Energía vital</Text>
+        <Text style={styles.title}>Índice de Vida</Text>
         <Text style={[styles.value, { color: TONE_COLOR[tone] }]}>{value === null ? '¿?' : value}</Text>
       </View>
       <View style={styles.track}>
